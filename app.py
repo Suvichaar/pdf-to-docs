@@ -18,8 +18,7 @@ from docx import Document
 from docx.shared import Pt
 
 # ---- .env fallback for local/dev --------------------------
-from dotenv import load_dotenv
-load_dotenv()  # loads variables from .env into os.environ
+
 
 # =========================
 # PAGE SETUP
