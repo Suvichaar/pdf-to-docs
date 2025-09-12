@@ -17,11 +17,15 @@ from botocore.exceptions import ClientError
 from docx import Document
 from docx.shared import Pt
 
+# ---- .env fallback for local/dev --------------------------
+from dotenv import load_dotenv
+load_dotenv()  # loads variables from .env into os.environ
+
 # =========================
 # PAGE SETUP
 # =========================
 st.set_page_config(page_title="PDF → DOCX Suvichaars", page_icon="📄", layout="wide")
-st.title("📄 PDF  DOCX with Suvichaar Doc AI")
+st.title("📄 PDF to DOCX with Suvichaar Doc AI")
 st.caption(
     "Upload a PDF → OCR extracts text → Download a .docx • "
     "Each PDF page deducts 1 page from your balance • Default balance: 10,000 pages (admin can top-up)"
@@ -36,12 +40,13 @@ DEFAULT_START_PAGES = 10_000  # per-user starting page allowance
 # SECRETS / CONFIG (NO HARDCODED DEFAULTS)
 # =========================
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    # Try Streamlit secrets.toml, else .env / environment
     try:
         return st.secrets[key]  # type: ignore[attr-defined]
     except Exception:
-        return default
+        return os.environ.get(key, default)
 
-# ---- SuvichaarOCR via your Azure-hosted endpoint (all from secrets)
+# ---- SuvichaarOCR via your Azure-hosted endpoint (all from secrets/env)
 MISTRAL_OCR_ENDPOINT = get_secret("MISTRAL_OCR_ENDPOINT")
 MISTRAL_API_KEY      = get_secret("MISTRAL_API_KEY")
 MISTRAL_MODEL        = get_secret("MISTRAL_MODEL", "mistral-document-ai-2505")
@@ -62,7 +67,7 @@ ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")
 # --- Admin Panel PIN (6 digits) ---
 ADMIN_PANEL_PIN = (get_secret("ADMIN_PANEL_PIN") or "").strip()
 if not re.fullmatch(r"\d{6}", ADMIN_PANEL_PIN):
-    st.error("ADMIN_PANEL_PIN missing/invalid. Set a 6-digit PIN in .streamlit/secrets.toml and restart.")
+    st.error("ADMIN_PANEL_PIN missing/invalid. Set a 6-digit PIN in .streamlit/secrets.toml or .env and restart.")
     st.stop()
 
 # Quick guards for required secrets
@@ -74,7 +79,7 @@ required = {
 }
 missing = [k for k, v in required.items() if not v]
 if missing:
-    st.error(f"Missing required secrets: {', '.join(missing)}. Add them to .streamlit/secrets.toml.")
+    st.error(f"Missing required config: {', '.join(missing)}. Add them to .streamlit/secrets.toml or .env.")
     st.stop()
 
 # =========================
@@ -141,7 +146,7 @@ def _migrate_to_pages_model(rec: Dict[str, Any]) -> Dict[str, Any]:
     return rec
 
 if not ADMIN_EMAIL or not ADMIN_PASSWORD:
-    st.error("ADMIN_EMAIL / ADMIN_PASSWORD not set in secrets.")
+    st.error("ADMIN_EMAIL / ADMIN_PASSWORD not set in config.")
     st.stop()
 
 if ADMIN_EMAIL not in st.session_state.users_db["users"]:
@@ -297,7 +302,6 @@ def ui_login():
             st.error("Invalid email or password.")
             return
 
-        # If account flagged for first-time reset, only accept temporary password and redirect to Reset
         if rec.get("force_pw_change"):
             temp_hash = rec.get("temp_pw_hash")
             if temp_hash and _set_pw(pw) == temp_hash:
@@ -309,7 +313,6 @@ def ui_login():
                 st.error("This account requires a password reset. Use your temporary password to proceed.")
                 return
 
-        # Normal login
         if _set_pw(pw) == rec.get("password_hash"):
             st.session_state.current_user = rec
             st.success(f"Welcome {rec.get('name') or rec['email']}!")
@@ -517,11 +520,16 @@ with st.sidebar:
                     run_s3_health_check()
 
 # =========================
-# SETTINGS
+# SETTINGS + DEBUG
 # =========================
 with st.expander("⚙️ Settings", expanded=False):
     add_page_breaks = st.checkbox("Insert page breaks between PDF pages", value=True, key="opt_page_breaks")
     show_raw_json    = st.checkbox("Show raw OCR JSON (debug)", value=False, key="opt_raw_json")
+
+with st.expander("🔎 Debug (env/secrets)"):
+    st.write("Endpoint:", MISTRAL_OCR_ENDPOINT)
+    st.write("Model:", MISTRAL_MODEL)
+    st.write("API key starts with:", (MISTRAL_API_KEY or "")[:6] + "…")
 
 # =========================
 # OCR HELPERS (Mistral) — base64-only + markdown-aware
@@ -540,7 +548,6 @@ def _post_ocr(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         resp.raise_for_status()
     except requests.HTTPError:
-        # Bubble useful message
         raise requests.HTTPError(f"{resp.status_code} {resp.reason}: {resp.text[:1500]}")
     try:
         return resp.json()
@@ -549,7 +556,7 @@ def _post_ocr(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def call_mistral_ocr_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
     """
-    Your endpoint only supports base64 data URLs.
+    Your endpoint supports only base64 data URLs (no external URLs).
     """
     payload = {
         "model": MISTRAL_MODEL,
@@ -607,10 +614,7 @@ def _extract_from_page(p: Dict[str, Any]) -> str:
                 return "\n".join(parts)
 
     t = _s(p.get("content") or p.get("text") or p.get("full_text") or p.get("raw_text"))
-    if t:
-        return t
-
-    return ""
+    return t or ""
 
 def extract_pages_texts(ocr_json: Dict[str, Any]) -> List[str]:
     """
@@ -621,9 +625,7 @@ def extract_pages_texts(ocr_json: Dict[str, Any]) -> List[str]:
     pages = container.get("pages")
 
     if isinstance(pages, list) and pages:
-        texts = []
-        for p in pages:
-            texts.append(_extract_from_page(p if isinstance(p, dict) else {}))
+        texts = [ _extract_from_page(p if isinstance(p, dict) else {}) for p in pages ]
         if any(x.strip() for x in texts):
             return texts
 
@@ -692,6 +694,10 @@ if uploaded is not None:
         pages_text = extract_pages_texts(ocr_json)
         pages_count = max(1, len(pages_text))
         st.success(f"Extracted text from **{pages_count} page(s)**.")
+
+        # Quick first-page preview (helps sanity check)
+        if pages_text and any(pages_text):
+            st.code((pages_text[0] or "")[:800], language="markdown")
 
         # Page debit (once per user+file hash)
         try:
