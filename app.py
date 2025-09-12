@@ -21,7 +21,7 @@ from docx.shared import Pt
 # PAGE SETUP
 # =========================
 st.set_page_config(page_title="PDF → DOCX Suvichaars", page_icon="📄", layout="wide")
-st.title("📄 PDF → DOCX with Suvichaar Doc AI ")
+st.title("📄 PDF to DOCX with Suvichaar Doc AI")
 st.caption(
     "Upload a PDF → OCR extracts text → Download a .docx • "
     "Each PDF page deducts 1 page from your balance • Default balance: 10,000 pages (admin can top-up)"
@@ -417,7 +417,6 @@ with st.sidebar:
                     else:
                         st.error("Invalid PIN. Please try again.")
             else:
-                # Lock button
                 if st.button("🔒 Lock Admin Panel", key="admin_pin_lock"):
                     st.session_state.admin_panel_unlocked = False
 
@@ -489,9 +488,6 @@ with st.sidebar:
                         save_users(db)
                         st.success("Updated.")
 
-                # =========================
-                # Set Tenant/Profile for any user
-                # =========================
                 st.markdown("---")
                 st.markdown("**Set Tenant ID / Profile ID**")
                 users_map = st.session_state.users_db.get("users", {})
@@ -515,9 +511,6 @@ with st.sidebar:
                             st.session_state.current_user = target
                         st.success(f"Updated tenant/profile for {sel_email}.")
 
-                # =========================
-                # S3 Health Check (no ACLs)
-                # =========================
                 st.markdown("---")
                 st.markdown("**S3 Health Check**")
                 if st.button("Run S3 Health Check", key="s3_health_btn"):
@@ -531,7 +524,7 @@ with st.expander("⚙️ Settings", expanded=False):
     show_raw_json    = st.checkbox("Show raw OCR JSON (debug)", value=False, key="opt_raw_json")
 
 # =========================
-# OCR HELPERS (Mistral)  — ROBUST VERSION
+# OCR HELPERS (Mistral) — ROBUST VERSION
 # =========================
 def bytes_to_data_url(mime: str, data: bytes) -> str:
     b64 = base64.b64encode(data).decode("utf-8")
@@ -554,62 +547,100 @@ def _presigned_pdf_url(pdf_bytes: bytes, key_hint: str, tenant_id: str, email: s
 def _post_ocr(payload: Dict[str, Any]) -> Dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "api-key": MISTRAL_API_KEY,          # some gateways require this
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
-    resp = requests.post(MISTRAL_OCR_ENDPOINT, headers=headers, json=payload, timeout=180)
-    resp.raise_for_status()
-    return resp.json()
+    resp = requests.post(MISTRAL_OCR_ENDPOINT, headers=headers, json=payload, timeout=300)
+    # Surface useful error body in Streamlit if non-2xx
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError:
+        raise requests.HTTPError(f"{resp.status_code} {resp.reason}: {resp.text[:1000]}")
+    try:
+        return resp.json()
+    except Exception:
+        # if OCR returns non-JSON (rare), wrap it
+        return {"raw": resp.text}
 
 def call_mistral_ocr_pdf(pdf_bytes: bytes, filename: str, tenant_id: str, email: str) -> Dict[str, Any]:
     """
-    1) Try base64 data URL (quick path)
-    2) On 400/413/415, fall back to S3 pre-signed URL
+    1) Try base64 data URL for small PDFs
+    2) Fall back to S3 pre-signed URL for large PDFs or when data-URL rejected
     """
-    data_url_payload = {
+    MAX_DATAURL_MB = 5
+    # If you can write to S3, you can presign (instance role or static keys). Only bucket must exist.
+    can_presign = bool(S3_BUCKET)
+
+    # Prefer data-URL for small files
+    if len(pdf_bytes) <= MAX_DATAURL_MB * 1024 * 1024:
+        try:
+            return _post_ocr({
+                "model": MISTRAL_MODEL,
+                "document": {
+                    "type": "document_url",
+                    "document_url": bytes_to_data_url("application/pdf", pdf_bytes)
+                },
+                "include_image_base64": False
+            })
+        except requests.HTTPError as e:
+            # If not size/schema issue, bubble it
+            msg = str(e)
+            if not any(code in msg for code in ("400", "413", "415")):
+                raise
+
+    # Large or rejected → use presigned URL if possible
+    if can_presign:
+        try:
+            presigned_url = _presigned_pdf_url(pdf_bytes, filename, tenant_id, email)
+            return _post_ocr({
+                "model": MISTRAL_MODEL,
+                "document": {
+                    "type": "document_url",
+                    "document_url": presigned_url
+                },
+                "include_image_base64": False
+            })
+        except Exception:
+            # Final fallback: try data URL anyway
+            return _post_ocr({
+                "model": MISTRAL_MODEL,
+                "document": {
+                    "type": "document_url",
+                    "document_url": bytes_to_data_url("application/pdf", pdf_bytes)
+                },
+                "include_image_base64": False
+            })
+
+    # No S3 available → last try with data URL
+    return _post_ocr({
         "model": MISTRAL_MODEL,
         "document": {
             "type": "document_url",
             "document_url": bytes_to_data_url("application/pdf", pdf_bytes)
         },
         "include_image_base64": False
-    }
-    try:
-        return _post_ocr(data_url_payload)
-    except requests.HTTPError as e:
-        code = getattr(e.response, "status_code", None)
-        if code not in (400, 413, 415):
-            raise
-
-    presigned_url = _presigned_pdf_url(pdf_bytes, filename, tenant_id, email)
-    url_payload = {
-        "model": MISTRAL_MODEL,
-        "document": {
-            "type": "document_url",
-            "document_url": presigned_url
-        },
-        "include_image_base64": False
-    }
-    return _post_ocr(url_payload)
+    })
 
 def extract_pages_texts(ocr_json: Dict[str, Any]) -> List[str]:
     """
     Return list[str] where each element is one page's text.
     Supports multiple common response shapes; never returns an empty DOCX.
     """
-    # unwrap if nested
+    # unwrap common containers
     container = ocr_json
-    for k in ("output", "response", "result", "data"):
+    for k in ("output", "response", "result", "data", "ocr", "document"):
         if isinstance(container, dict) and isinstance(container.get(k), dict):
             container = container[k]
 
+    # direct pages
     pages = container.get("pages")
-    pages_txt: List[str] = []
     if isinstance(pages, list) and pages:
+        out = []
         for p in pages:
             if not isinstance(p, dict):
-                pages_txt.append("")
+                out.append("")
                 continue
-
             # lines
             if isinstance(p.get("lines"), list):
                 lines = []
@@ -619,9 +650,8 @@ def extract_pages_texts(ocr_json: Dict[str, Any]) -> List[str]:
                         if t:
                             lines.append(t)
                 if lines:
-                    pages_txt.append("\n".join(lines))
+                    out.append("\n".join(lines))
                     continue
-
             # paragraphs
             if isinstance(p.get("paragraphs"), list):
                 paras = []
@@ -631,33 +661,31 @@ def extract_pages_texts(ocr_json: Dict[str, Any]) -> List[str]:
                         if t:
                             paras.append(t)
                 if paras:
-                    pages_txt.append("\n".join(paras))
+                    out.append("\n".join(paras))
                     continue
+            # page-level
+            out.append((p.get("content") or p.get("text") or p.get("full_text") or "").strip())
+        return out
 
-            # page-level content/text
-            t = (p.get("content") or p.get("text") or "").strip()
-            pages_txt.append(t)
-        return pages_txt
+    # single-text fields
+    for k in ("full_text", "content", "text", "raw_text"):
+        if isinstance(container.get(k), str) and container[k].strip():
+            return [container[k].strip()]
 
-    # flat content fields
-    for key in ("full_text", "content", "text", "raw_text"):
-        if isinstance(container.get(key), str) and container[key].strip():
-            return [container[key].strip()]
-
-    # blocks/items/elements array
-    for key in ("blocks", "items", "elements"):
-        arr = container.get(key)
+    # blocky shapes
+    for k in ("blocks", "items", "elements", "regions"):
+        arr = container.get(k)
         if isinstance(arr, list) and arr:
-            collected = []
+            texts = []
             for it in arr:
                 if isinstance(it, dict):
-                    t = (it.get("text") or it.get("content") or "").strip()
+                    t = (it.get("text") or it.get("content") or it.get("value") or "").strip()
                     if t:
-                        collected.append(t)
-            if collected:
-                return ["\n".join(collected)]
+                        texts.append(t)
+            if texts:
+                return ["\n".join(texts)]
 
-    # last resort: dump the JSON so DOCX isn’t empty
+    # ensure DOCX is not empty, show raw JSON
     return [json.dumps(ocr_json, ensure_ascii=False)]
 
 def result_to_docx_bytes(pages_text: List[str], insert_page_breaks: bool = True) -> bytes:
@@ -705,13 +733,9 @@ if uploaded is not None:
 
         with st.spinner("Analyzing with Suvichaar Intelligence..."):
             try:
-                # Updated to pass filename + tenant/email for presigned fallback
                 ocr_json = call_mistral_ocr_pdf(pdf_bytes, uploaded.name, u.get("tenant_id", "default"), u["email"])
             except requests.HTTPError as e:
-                try:
-                    st.error(f"OCR failed: {e.response.status_code} — {e.response.text[:500]}")
-                except Exception:
-                    st.error(f"OCR failed: {e}")
+                st.error(f"OCR failed: {e}")
                 st.stop()
             except Exception as e:
                 st.error(f"OCR request failed: {e}")
