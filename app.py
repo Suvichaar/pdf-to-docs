@@ -21,7 +21,7 @@ from docx.shared import Pt
 # PAGE SETUP
 # =========================
 st.set_page_config(page_title="PDF → DOCX Suvichaars", page_icon="📄", layout="wide")
-st.title("📄 PDF to DOCX with Suvichaar Doc AI")
+st.title("📄 PDF  DOCX with Suvichaar Doc AI")
 st.caption(
     "Upload a PDF → OCR extracts text → Download a .docx • "
     "Each PDF page deducts 1 page from your balance • Default balance: 10,000 pages (admin can top-up)"
