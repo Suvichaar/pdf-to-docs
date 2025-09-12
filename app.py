@@ -525,10 +525,6 @@ with st.expander("⚙️ Settings", expanded=False):
     add_page_breaks = st.checkbox("Insert page breaks between PDF pages", value=True, key="opt_page_breaks")
     show_raw_json    = st.checkbox("Show raw OCR JSON (debug)", value=False, key="opt_raw_json")
 
-with st.expander("🔎 Debug (env/secrets)"):
-    st.write("Endpoint:", MISTRAL_OCR_ENDPOINT)
-    st.write("Model:", MISTRAL_MODEL)
-    st.write("API key starts with:", (MISTRAL_API_KEY or "")[:6] + "…")
 
 # =========================
 # OCR HELPERS (Mistral) — base64-only + markdown-aware
