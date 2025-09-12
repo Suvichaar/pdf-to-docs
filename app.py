@@ -21,7 +21,7 @@ from docx.shared import Pt
 # PAGE SETUP
 # =========================
 st.set_page_config(page_title="PDF → DOCX Suvichaars", page_icon="📄", layout="wide")
-st.title("📄 PDF → DOCX with Mistral Document AI (OCR)")
+st.title("📄 PDF → DOCX with Suvichaar Doc AI ")
 st.caption(
     "Upload a PDF → OCR extracts text → Download a .docx • "
     "Each PDF page deducts 1 page from your balance • Default balance: 10,000 pages (admin can top-up)"
@@ -41,7 +41,7 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     except Exception:
         return default
 
-# ---- Mistral OCR via your Azure-hosted endpoint (all from secrets)
+# ---- SuvichaarOCR via your Azure-hosted endpoint (all from secrets)
 MISTRAL_OCR_ENDPOINT = get_secret("MISTRAL_OCR_ENDPOINT")
 MISTRAL_API_KEY      = get_secret("MISTRAL_API_KEY")
 MISTRAL_MODEL        = get_secret("MISTRAL_MODEL", "mistral-document-ai-2505")
@@ -539,7 +539,7 @@ def bytes_to_data_url(mime: str, data: bytes) -> str:
 
 def call_mistral_ocr_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
     """
-    Calls your Mistral OCR endpoint with a base64 data URL for the PDF.
+    Calls your SuvichaarOCR endpoint with a base64 data URL for the PDF.
     """
     headers = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
@@ -645,7 +645,7 @@ if uploaded is not None:
         u = get_user_rec()
         silent_upload_pdf(fid, uploaded.name, pdf_bytes, u.get("tenant_id", "default"), u["email"])
 
-        with st.spinner("Analyzing with Mistral OCR..."):
+        with st.spinner("Analyzing with Suvichaar Intelligence..."):
             try:
                 ocr_json = call_mistral_ocr_pdf(pdf_bytes)
             except requests.HTTPError as e:
