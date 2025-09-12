@@ -531,75 +531,134 @@ with st.expander("⚙️ Settings", expanded=False):
     show_raw_json    = st.checkbox("Show raw OCR JSON (debug)", value=False, key="opt_raw_json")
 
 # =========================
-# OCR HELPERS (Mistral)
+# OCR HELPERS (Mistral)  — ROBUST VERSION
 # =========================
 def bytes_to_data_url(mime: str, data: bytes) -> str:
     b64 = base64.b64encode(data).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
-def call_mistral_ocr_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
+def _presigned_pdf_url(pdf_bytes: bytes, key_hint: str, tenant_id: str, email: str) -> str:
     """
-    Calls your SuvichaarOCR endpoint with a base64 data URL for the PDF.
+    Uploads the PDF to S3 and returns a pre-signed GET URL (fallback for large PDFs).
     """
+    fid = file_hash(pdf_bytes)
+    key = _build_object_key(S3_PREFIX, "uploads", tenant_id, email, fid, key_hint, "pdf")
+    _put_bytes_to_s3(key, pdf_bytes, "application/pdf")
+    client = _get_s3_client(AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+    return client.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=3600,  # 1 hour
+    )
+
+def _post_ocr(payload: Dict[str, Any]) -> Dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
+    resp = requests.post(MISTRAL_OCR_ENDPOINT, headers=headers, json=payload, timeout=180)
+    resp.raise_for_status()
+    return resp.json()
+
+def call_mistral_ocr_pdf(pdf_bytes: bytes, filename: str, tenant_id: str, email: str) -> Dict[str, Any]:
+    """
+    1) Try base64 data URL (quick path)
+    2) On 400/413/415, fall back to S3 pre-signed URL
+    """
+    data_url_payload = {
         "model": MISTRAL_MODEL,
         "document": {
             "type": "document_url",
             "document_url": bytes_to_data_url("application/pdf", pdf_bytes)
         },
-        "include_image_base64": False  # set True if you want rendered page images in response
+        "include_image_base64": False
     }
-    resp = requests.post(MISTRAL_OCR_ENDPOINT, headers=headers, json=payload, timeout=120)
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        return _post_ocr(data_url_payload)
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", None)
+        if code not in (400, 413, 415):
+            raise
+
+    presigned_url = _presigned_pdf_url(pdf_bytes, filename, tenant_id, email)
+    url_payload = {
+        "model": MISTRAL_MODEL,
+        "document": {
+            "type": "document_url",
+            "document_url": presigned_url
+        },
+        "include_image_base64": False
+    }
+    return _post_ocr(url_payload)
 
 def extract_pages_texts(ocr_json: Dict[str, Any]) -> List[str]:
     """
-    Tries to extract a list of page-wise texts from various possible OCR JSON shapes.
-    Fallback: single page with concatenated content.
+    Return list[str] where each element is one page's text.
+    Supports multiple common response shapes; never returns an empty DOCX.
     """
-    pages_txt: List[str] = []
+    # unwrap if nested
+    container = ocr_json
+    for k in ("output", "response", "result", "data"):
+        if isinstance(container, dict) and isinstance(container.get(k), dict):
+            container = container[k]
 
-    # Common pattern: result/pages -> lines/content
-    pages = ocr_json.get("pages") or ocr_json.get("result", {}).get("pages") or ocr_json.get("data", {}).get("pages")
+    pages = container.get("pages")
+    pages_txt: List[str] = []
     if isinstance(pages, list) and pages:
         for p in pages:
-            # 1) lines[].content
-            if isinstance(p, dict) and "lines" in p and isinstance(p["lines"], list):
+            if not isinstance(p, dict):
+                pages_txt.append("")
+                continue
+
+            # lines
+            if isinstance(p.get("lines"), list):
                 lines = []
                 for ln in p["lines"]:
-                    text = (ln.get("content") or ln.get("text") or "").strip() if isinstance(ln, dict) else ""
-                    if text:
-                        lines.append(text)
-                pages_txt.append("\n".join(lines).strip())
-                continue
-            # 2) page-level content
-            if isinstance(p, dict) and (p.get("content") or p.get("text")):
-                pages_txt.append((p.get("content") or p.get("text") or "").strip())
-                continue
-            # 3) else empty page
-            pages_txt.append("")
+                    if isinstance(ln, dict):
+                        t = (ln.get("content") or ln.get("text") or "").strip()
+                        if t:
+                            lines.append(t)
+                if lines:
+                    pages_txt.append("\n".join(lines))
+                    continue
+
+            # paragraphs
+            if isinstance(p.get("paragraphs"), list):
+                paras = []
+                for para in p["paragraphs"]:
+                    if isinstance(para, dict):
+                        t = (para.get("content") or para.get("text") or "").strip()
+                        if t:
+                            paras.append(t)
+                if paras:
+                    pages_txt.append("\n".join(paras))
+                    continue
+
+            # page-level content/text
+            t = (p.get("content") or p.get("text") or "").strip()
+            pages_txt.append(t)
         return pages_txt
 
-    # Flat content fields
-    for key in ("content", "text"):
-        if isinstance(ocr_json.get(key), str) and ocr_json.get(key).strip():
-            return [ocr_json[key].strip()]
+    # flat content fields
+    for key in ("full_text", "content", "text", "raw_text"):
+        if isinstance(container.get(key), str) and container[key].strip():
+            return [container[key].strip()]
 
-    # Some providers nest under result/data
-    for root in ("result", "data"):
-        node = ocr_json.get(root)
-        if isinstance(node, dict):
-            for key in ("content", "text"):
-                if isinstance(node.get(key), str) and node.get(key).strip():
-                    return [node[key].strip()]
+    # blocks/items/elements array
+    for key in ("blocks", "items", "elements"):
+        arr = container.get(key)
+        if isinstance(arr, list) and arr:
+            collected = []
+            for it in arr:
+                if isinstance(it, dict):
+                    t = (it.get("text") or it.get("content") or "").strip()
+                    if t:
+                        collected.append(t)
+            if collected:
+                return ["\n".join(collected)]
 
-    # Fallback
-    return [""]
+    # last resort: dump the JSON so DOCX isn’t empty
+    return [json.dumps(ocr_json, ensure_ascii=False)]
 
 def result_to_docx_bytes(pages_text: List[str], insert_page_breaks: bool = True) -> bytes:
     doc = Document()
@@ -607,7 +666,6 @@ def result_to_docx_bytes(pages_text: List[str], insert_page_breaks: bool = True)
     style.font.name = "Calibri"
     style.font.size = Pt(11)
 
-    # If we have multiple pages, add headings; else just paragraphs
     if len(pages_text) > 1:
         for i, txt in enumerate(pages_text, start=1):
             doc.add_heading(f"Page {i}", level=2)
@@ -647,7 +705,8 @@ if uploaded is not None:
 
         with st.spinner("Analyzing with Suvichaar Intelligence..."):
             try:
-                ocr_json = call_mistral_ocr_pdf(pdf_bytes)
+                # Updated to pass filename + tenant/email for presigned fallback
+                ocr_json = call_mistral_ocr_pdf(pdf_bytes, uploaded.name, u.get("tenant_id", "default"), u["email"])
             except requests.HTTPError as e:
                 try:
                     st.error(f"OCR failed: {e.response.status_code} — {e.response.text[:500]}")
