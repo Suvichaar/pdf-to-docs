@@ -258,8 +258,7 @@ def run_s3_health_check():
         source = "static keys" if _have_static_creds() else "instance/role"
         st.info(f"Using AWS credentials from: {source}")
 
-        loc = client.get_bucket_location(Bucket=S3_B
-UCKET).get("LocationConstraint") or "us-east-1"
+        loc = client.get_bucket_location(Bucket=S3_BUCKET).get("LocationConstraint") or "us-east-1"
         st.success(f"S3 bucket location: {loc}")
 
         test_key = f"{(S3_PREFIX or 'media/pdf2docx').rstrip('/')}/healthcheck/{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.txt"
