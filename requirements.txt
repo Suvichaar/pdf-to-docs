@@ -8,3 +8,4 @@ openai
 matplotlib
 python-docx
 pypandoc 
+PyMuPDF
